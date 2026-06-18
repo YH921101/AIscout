@@ -1,0 +1,8 @@
+beautifulsoup4==4.12.3
+Flask==3.0.3
+gunicorn==22.0.0
+openai>=2.0.0
+pdfminer.six==20240706
+python-dotenv==1.0.1
+requests==2.32.3
+tzdata==2024.1
