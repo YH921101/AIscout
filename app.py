@@ -63,7 +63,48 @@ SCOUT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "impact_summary": {"type": "string"},
         "judgement": {"type": "string"},
+        "score_breakdown": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "material_impact": {"type": "integer", "minimum": 0, "maximum": 30},
+                "novelty_unpriced": {"type": "integer", "minimum": 0, "maximum": 20},
+                "theme_policy": {"type": "integer", "minimum": 0, "maximum": 15},
+                "short_term_reaction": {"type": "integer", "minimum": 0, "maximum": 15},
+                "earnings_confidence": {"type": "integer", "minimum": 0, "maximum": 10},
+                "risk_penalty": {"type": "integer", "minimum": -20, "maximum": 0},
+            },
+            "required": [
+                "material_impact",
+                "novelty_unpriced",
+                "theme_policy",
+                "short_term_reaction",
+                "earnings_confidence",
+                "risk_penalty",
+            ],
+        },
+        "score_rationale": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "material_impact": {"type": "string"},
+                "novelty_unpriced": {"type": "string"},
+                "theme_policy": {"type": "string"},
+                "short_term_reaction": {"type": "string"},
+                "earnings_confidence": {"type": "string"},
+                "risk_penalty": {"type": "string"},
+            },
+            "required": [
+                "material_impact",
+                "novelty_unpriced",
+                "theme_policy",
+                "short_term_reaction",
+                "earnings_confidence",
+                "risk_penalty",
+            ],
+        },
         "reasons": {"type": "array", "items": {"type": "string"}},
         "watch_points": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "array", "items": {"type": "string"}},
@@ -71,7 +112,10 @@ SCOUT_SCHEMA = {
     },
     "required": [
         "score",
+        "impact_summary",
         "judgement",
+        "score_breakdown",
+        "score_rationale",
         "reasons",
         "watch_points",
         "risks",
@@ -417,6 +461,19 @@ def build_scout_prompt(
     body = pdf_text.strip() or "PDF本文の抽出に失敗、または本文なし。タイトルとメタ情報だけで慎重に判定。"
     return f"""
 以下のTDnet開示を0〜100点で採点してください。
+総合点は必ず以下の内訳点を合算して算出してください。
+
+点数内訳:
+- 材料インパクト material_impact: 0〜30点
+- 新規性・未織り込み novelty_unpriced: 0〜20点
+- テーマ性・国策 theme_policy: 0〜15点
+- 短期反応しやすさ short_term_reaction: 0〜15点
+- 業績寄与の確度 earnings_confidence: 0〜10点
+- リスク控除 risk_penalty: 0〜-20点
+
+raw_total = material_impact + novelty_unpriced + theme_policy + short_term_reaction + earnings_confidence + risk_penalty
+score = round(raw_total / 90 * 100)
+ただし0未満は0、100超は100に丸めてください。
 
 通知基準:
 - 95点以上: Discord通知に値する。数値インパクト・新規性・短期反応可能性がかなり強い。
@@ -425,7 +482,7 @@ def build_scout_prompt(
 
 評価観点:
 - 売上高比で大きい案件か。
-- 受注残・受注高・月次KPIが前年同期比で大きく増えているか。
+- 受注残・受注高・月次KPIが前年同期比または前月比で何％増えているか。
 - 会社予想にまだ織り込まれていない可能性があるか。
 - 時価総額に対して材料が大きいか。
 - 国策・テーマ性があるか。
@@ -433,10 +490,23 @@ def build_scout_prompt(
 - 出尽くし売りや失望リスクがあるか。
 - 既に株価が大きく上がりすぎていないか。
 
+最重要:
+- impact_summaryには、最初に読むべき定量インパクトを1〜2文で書いてください。
+- 月次・KPI・決算・業績修正では「前年同期比/前月比/会社計画比で何％増減か」を明記してください。
+- 大型受注・契約・補助金・設備投資・提携では「売上や利益への影響がどの程度ありそうか」を明記してください。
+- PDFに明確な数値がない場合は「数値開示なし」「推定」と明記し、過度に断定しないでください。
+- 将来影響を推定する場合は「推定: 2年後売上+10〜15％程度の可能性」のように、推定であることと前提を短く書いてください。
+
 減点:
 - 役員人事、株式報酬、定款、自己株取得の進捗、形式的な訂正など、短期材料性が弱い開示。
 - 数値規模が不明、既に業績予想へ反映済み、または一過性の可能性が高い開示。
 - 下方修正は原則低評価。ただし悪材料出尽くしや構造改善が明確なら理由を明記。
+
+score_rationaleには、score_breakdownの各項目について、その点数にした理由を1文で書いてください。
+reasonsには、投資家が最初に理解すべき要約理由を2〜4個で書いてください。
+score_rationaleとreasonsの違い:
+- score_rationale: 点数内訳に直接ひもづく採点理由。
+- reasons: 通知本文として読みやすい投資判断の要約。
 
 開示:
 - 銘柄: {disclosure.get("company", "")}
@@ -479,7 +549,24 @@ def heuristic_score(disclosure: dict[str, Any], pdf_text: str) -> dict[str, Any]
     score = max(0, min(score, 100))
     return {
         "score": score,
+        "impact_summary": "DRY_RUNのため定量インパクトは推定していません。",
         "judgement": "DRY_RUNの簡易判定です。本番ではOpenAI APIの判定を使用してください。",
+        "score_breakdown": {
+            "material_impact": min(30, max(0, score - 60)),
+            "novelty_unpriced": 10,
+            "theme_policy": 5,
+            "short_term_reaction": 5,
+            "earnings_confidence": 3,
+            "risk_penalty": -5 if "下方修正" in text else 0,
+        },
+        "score_rationale": {
+            "material_impact": "DRY_RUNではキーワード一致に応じて簡易加点しています。",
+            "novelty_unpriced": "新規性は本文精査なしの仮評価です。",
+            "theme_policy": "テーマ性はタイトル内キーワードで仮評価しています。",
+            "short_term_reaction": "短期反応はタイトル材料性のみで仮評価しています。",
+            "earnings_confidence": "業績寄与確度はDRY_RUNでは低めに固定しています。",
+            "risk_penalty": "下方修正キーワードがある場合のみ簡易減点します。",
+        },
         "reasons": ["タイトルと本文キーワードから機械的に仮採点しました。"],
         "watch_points": ["本番運用前にOPENAI_API_KEYとDRY_RUN=falseを設定してください。"],
         "risks": ["簡易判定は数値規模や織り込み度を十分に評価できません。"],
@@ -489,6 +576,10 @@ def heuristic_score(disclosure: dict[str, Any], pdf_text: str) -> dict[str, Any]
 
 def format_discord_message(disclosure: dict[str, Any], score: dict[str, Any]) -> str:
     reasons = bullet_lines(score.get("reasons", []), limit=4)
+    breakdown = format_score_breakdown(
+        score.get("score_breakdown", {}),
+        score.get("score_rationale", {}),
+    )
     watch_points = bullet_lines(score.get("watch_points", []), limit=3)
     risks = bullet_lines(score.get("risks", []), limit=3)
     message = f"""🔥 全市場AIスカウト
@@ -498,8 +589,14 @@ def format_discord_message(disclosure: dict[str, Any], score: dict[str, Any]) ->
 開示タイトル：{disclosure.get("title", "")}
 スコア：{score.get("score", "")}
 
+インパクト：
+{score.get("impact_summary", "")}
+
 判定：
 {score.get("judgement", "")}
+
+点数内訳：
+{breakdown}
 
 理由：
 {reasons}
@@ -513,6 +610,29 @@ def format_discord_message(disclosure: dict[str, Any], score: dict[str, Any]) ->
 URL：
 {disclosure.get("url", "")}"""
     return truncate_discord_message(message)
+
+
+def format_score_breakdown(breakdown: dict[str, Any], rationale: dict[str, Any]) -> str:
+    labels = [
+        ("material_impact", "材料インパクト", 30),
+        ("novelty_unpriced", "新規性・未織り込み", 20),
+        ("theme_policy", "テーマ性・国策", 15),
+        ("short_term_reaction", "短期反応", 15),
+        ("earnings_confidence", "業績寄与確度", 10),
+        ("risk_penalty", "リスク控除", -20),
+    ]
+    lines = []
+    for key, label, maximum in labels:
+        value = breakdown.get(key)
+        if value is None:
+            continue
+        suffix = f"/{maximum}" if maximum > 0 else ""
+        reason = clean_text(str(rationale.get(key, "")))
+        if reason:
+            lines.append(f"- {label}: {value}{suffix} - {reason}")
+        else:
+            lines.append(f"- {label}: {value}{suffix}")
+    return "\n".join(lines) if lines else "- 内訳なし"
 
 
 def bullet_lines(items: list[Any], limit: int) -> str:
