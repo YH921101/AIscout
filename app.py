@@ -154,6 +154,15 @@ session.headers.update(
 )
 run_lock = threading.Lock()
 state_lock = threading.Lock()
+job_status_lock = threading.Lock()
+job_status: dict[str, Any] = {
+    "running": False,
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_http_status": None,
+    "last_result": None,
+    "last_error": None,
+}
 
 
 def now_jst() -> datetime:
@@ -658,6 +667,51 @@ def _run_once_locked() -> tuple[dict[str, Any], int]:
     return result, status
 
 
+def run_once_background() -> bool:
+    with job_status_lock:
+        if job_status["running"]:
+            return False
+        job_status.update(
+            {
+                "running": True,
+                "last_started_at": now_jst().isoformat(),
+                "last_finished_at": None,
+                "last_http_status": None,
+                "last_error": None,
+            }
+        )
+
+    thread = threading.Thread(target=_background_worker, daemon=True)
+    thread.start()
+    return True
+
+
+def _background_worker() -> None:
+    try:
+        result, status = run_once()
+        with job_status_lock:
+            job_status.update(
+                {
+                    "running": False,
+                    "last_finished_at": now_jst().isoformat(),
+                    "last_http_status": status,
+                    "last_result": result,
+                    "last_error": None,
+                }
+            )
+    except Exception as exc:
+        logger.exception("Background run failed")
+        with job_status_lock:
+            job_status.update(
+                {
+                    "running": False,
+                    "last_finished_at": now_jst().isoformat(),
+                    "last_http_status": 500,
+                    "last_error": str(exc),
+                }
+            )
+
+
 def request_authorized() -> bool:
     if not settings.run_token:
         return True
@@ -672,6 +726,7 @@ def index():
             "name": "全市場AIスカウトBOT",
             "health": "/health",
             "run": "/run?token=YOUR_RUN_TOKEN",
+            "status": "/status?token=YOUR_RUN_TOKEN",
             "dry_run": settings.dry_run,
             "model": settings.openai_model,
             "notify_threshold": settings.notify_threshold,
@@ -690,12 +745,26 @@ def health():
     )
 
 
+@app.get("/status")
+def status_endpoint():
+    if not request_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    with job_status_lock:
+        return jsonify({"ok": True, **job_status})
+
+
 @app.get("/run")
 def run_endpoint():
     if not request_authorized():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    result, status = run_once()
-    return jsonify(result), status
+    if request.args.get("sync") == "1":
+        result, status = run_once()
+        return jsonify(result), status
+
+    started = run_once_background()
+    if not started:
+        return jsonify({"ok": True, "started": False, "message": "previous run is still in progress"}), 200
+    return jsonify({"ok": True, "started": True, "status": "/status"}), 202
 
 
 if __name__ == "__main__":
