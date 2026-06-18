@@ -415,6 +415,119 @@ def fetch_pdf_text(pdf_url: str) -> str:
     return compact[: settings.pdf_text_max_chars]
 
 
+def resolve_test_pdf_url(input_url: str) -> tuple[str, dict[str, Any]]:
+    normalized_url = input_url.strip()
+    if urlparse(normalized_url).path.lower().endswith(".pdf"):
+        return normalized_url, {"input_url": input_url, "resolved_from": "pdf_url"}
+
+    html = fetch_text(normalized_url)
+    soup = BeautifulSoup(html, "html.parser")
+    meta = extract_page_meta(soup, normalized_url)
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+        if ".pdf" in href.lower():
+            return urljoin(normalized_url, href), {**meta, "input_url": input_url, "resolved_from": "html_link"}
+
+    irbank_match = re.search(r"/(\d{4})/(\d{16})/?$", urlparse(normalized_url).path)
+    if irbank_match:
+        disclosure_id = irbank_match.group(2)
+        date_match = re.match(r"140120(\d{6})", disclosure_id)
+        if date_match:
+            yymmdd = date_match.group(1)
+            ymd = f"20{yymmdd}"
+            pdf_url = f"https://f.irbank.net/pdf/{ymd}/{disclosure_id}.pdf"
+            return pdf_url, {**meta, "input_url": input_url, "resolved_from": "irbank_pattern"}
+
+    raise ValueError("PDF URL could not be resolved from the supplied URL")
+
+
+def extract_page_meta(soup: BeautifulSoup, page_url: str) -> dict[str, Any]:
+    text = clean_text(soup.get_text("\n", strip=True))
+    path_parts = [part for part in urlparse(page_url).path.split("/") if part]
+    code = path_parts[0] if path_parts and re.fullmatch(r"\d{4}", path_parts[0]) else ""
+
+    company = ""
+    company_match = re.search(r"【提出】\s*(\d{4})?\s*([^\n【]+)", text)
+    if company_match:
+        company = clean_text(company_match.group(2))
+
+    title = ""
+    title_match = re.search(r"【名称】\s*([^\n【]+)", text)
+    if title_match:
+        title = clean_text(title_match.group(1))
+
+    return {
+        "page_url": page_url,
+        "page_code": normalize_code(code) if code else "",
+        "page_company": company,
+        "page_title": title,
+    }
+
+
+def infer_disclosure_from_pdf_url(pdf_url: str, pdf_text: str) -> dict[str, Any]:
+    lines = [clean_text(line) for line in pdf_text.splitlines() if clean_text(line)]
+    joined = "\n".join(lines[:40])
+
+    company = ""
+    code = ""
+    title = ""
+
+    code_match = re.search(r"(?:コード番号|コード|証券コード)\s*[:：]?\s*([0-9A-Z]{4,5})", joined)
+    if code_match:
+        code = normalize_code(code_match.group(1))
+
+    for idx, line in enumerate(lines[:30]):
+        if line in {"会社名", "会社 名", "会 社 名"} and idx + 1 < len(lines):
+            company = clean_text(lines[idx + 1])
+            break
+        if "株式会社" in line and len(line) <= 40:
+            company = line
+            break
+
+    title_candidates = [
+        line
+        for line in lines[:60]
+        if (
+            ("お知らせ" in line or "について" in line or "関する" in line)
+            and "問合せ" not in line
+            and "会社名" not in line
+            and len(line) <= 90
+        )
+    ]
+    if title_candidates:
+        title = title_candidates[-1]
+
+    return {
+        "id": disclosure_id_from_url(pdf_url),
+        "date": now_jst().strftime("%Y%m%d"),
+        "time": now_jst().strftime("%H:%M"),
+        "published_at": now_jst().isoformat(),
+        "code": code or "不明",
+        "tdnet_code": code or "",
+        "company": company or "不明",
+        "title": title or "TDnet URL指定テスト",
+        "exchange": "",
+        "url": pdf_url,
+        "source_page": "",
+    }
+
+
+def apply_page_meta(disclosure: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    if meta.get("page_code") and disclosure.get("code") in {"", "不明"}:
+        disclosure["code"] = meta["page_code"]
+        disclosure["tdnet_code"] = meta["page_code"]
+    if meta.get("page_company") and disclosure.get("company") in {"", "不明"}:
+        disclosure["company"] = meta["page_company"]
+    if meta.get("page_title") and disclosure.get("title") in {"", "TDnet URL指定テスト"}:
+        disclosure["title"] = meta["page_title"]
+    if meta.get("page_url"):
+        disclosure["source_page"] = meta["page_url"]
+    disclosure["input_url"] = meta.get("input_url", disclosure.get("url", ""))
+    disclosure["resolved_from"] = meta.get("resolved_from", "")
+    return disclosure
+
+
 def score_disclosure(disclosure: dict[str, Any], pdf_text: str) -> dict[str, Any]:
     if settings.dry_run:
         return heuristic_score(disclosure, pdf_text)
@@ -662,6 +775,57 @@ def send_discord(message: str) -> None:
     response.raise_for_status()
 
 
+def sample_disclosure() -> dict[str, Any]:
+    return {
+        "company": "テスト株式会社",
+        "code": "1234",
+        "title": "大型受注に関するお知らせ",
+        "url": "https://www.release.tdnet.info/inbs/sample.pdf",
+    }
+
+
+def sample_score() -> dict[str, Any]:
+    return {
+        "score": 96,
+        "impact_summary": (
+            "テスト通知です。推定: 受注額が前期売上の約25〜30%相当なら、"
+            "今期〜来期売上を+15〜25%押し上げる可能性。"
+        ),
+        "judgement": "Discord通知フォーマット確認用のサンプルです。本通知は投資判断ではありません。",
+        "score_breakdown": {
+            "material_impact": 28,
+            "novelty_unpriced": 18,
+            "theme_policy": 12,
+            "short_term_reaction": 14,
+            "earnings_confidence": 9,
+            "risk_penalty": -5,
+        },
+        "score_rationale": {
+            "material_impact": "会社規模に対して受注額が大きい想定のため高評価。",
+            "novelty_unpriced": "初出の大型受注として未織り込み余地がある想定。",
+            "theme_policy": "国策・成長テーマに関連する想定で加点。",
+            "short_term_reaction": "短期資金が反応しやすい明確な材料という想定。",
+            "earnings_confidence": "契約済み想定だが利益率と納期が不明なため満点ではない。",
+            "risk_penalty": "既に株価上昇済みの場合の出尽くしリスクを控除。",
+        },
+        "reasons": [
+            "会社規模に対して材料が大きい想定",
+            "初出材料として短期反応しやすい想定",
+            "ただし利益率や納期が不明なため一部減点",
+        ],
+        "watch_points": [
+            "受注額の売上高比",
+            "業績予想への反映有無",
+            "翌営業日の出来高と寄り付き",
+        ],
+        "risks": [
+            "これは疎通確認用のテスト通知",
+            "実際の開示分析ではありません",
+        ],
+        "one_line_summary": "Discord通知フォーマット確認",
+    }
+
+
 def mark_seen(
     state: dict[str, Any],
     disclosure: dict[str, Any],
@@ -806,6 +970,36 @@ def run_once_background() -> bool:
     return True
 
 
+def run_test_url_background(input_url: str, force_notify: bool) -> bool:
+    with job_status_lock:
+        if job_status["running"]:
+            return False
+        job_status.update(
+            {
+                "running": True,
+                "last_started_at": now_jst().isoformat(),
+                "last_finished_at": None,
+                "last_http_status": None,
+                "last_error": None,
+                "last_result": {
+                    "ok": True,
+                    "mode": "test_url",
+                    "url": input_url,
+                    "force_notify": force_notify,
+                    "message": "test URL scoring started",
+                },
+            }
+        )
+
+    thread = threading.Thread(
+        target=_test_url_worker,
+        args=(input_url, force_notify),
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
 def _background_worker() -> None:
     try:
         result, status = run_once()
@@ -832,6 +1026,61 @@ def _background_worker() -> None:
             )
 
 
+def _test_url_worker(input_url: str, force_notify: bool) -> None:
+    try:
+        pdf_url, page_meta = resolve_test_pdf_url(input_url)
+        pdf_text = fetch_pdf_text(pdf_url)
+        disclosure = infer_disclosure_from_pdf_url(pdf_url, pdf_text)
+        disclosure = apply_page_meta(disclosure, page_meta)
+        disclosure["matched_keywords"] = title_matches(disclosure.get("title", ""))
+        score = score_disclosure(disclosure, pdf_text)
+        score_value = int(score.get("score", 0))
+        sent = False
+        if force_notify or score_value >= settings.notify_threshold:
+            send_discord(format_discord_message(disclosure, score))
+            sent = True
+
+        result = {
+            "ok": True,
+            "mode": "test_url",
+            "input_url": input_url,
+            "resolved_pdf_url": pdf_url,
+            "resolved_from": page_meta.get("resolved_from", ""),
+            "force_notify": force_notify,
+            "sent": sent,
+            "score": score_value,
+            "disclosure": disclosure,
+            "analysis": score,
+        }
+        with job_status_lock:
+            job_status.update(
+                {
+                    "running": False,
+                    "last_finished_at": now_jst().isoformat(),
+                    "last_http_status": 200,
+                    "last_result": result,
+                    "last_error": None,
+                }
+            )
+    except Exception as exc:
+        logger.exception("Test URL run failed")
+        with job_status_lock:
+            job_status.update(
+                {
+                    "running": False,
+                    "last_finished_at": now_jst().isoformat(),
+                    "last_http_status": 500,
+                    "last_error": str(exc),
+                    "last_result": {
+                        "ok": False,
+                        "mode": "test_url",
+                        "url": input_url,
+                        "force_notify": force_notify,
+                    },
+                }
+            )
+
+
 def request_authorized() -> bool:
     if not settings.run_token:
         return True
@@ -847,6 +1096,8 @@ def index():
             "health": "/health",
             "run": "/run?token=YOUR_RUN_TOKEN",
             "status": "/status?token=YOUR_RUN_TOKEN",
+            "test_notify": "/test-notify?token=YOUR_RUN_TOKEN",
+            "test_url": "/test-url?token=YOUR_RUN_TOKEN&url=TDNET_OR_IRBANK_URL&notify=1",
             "dry_run": settings.dry_run,
             "model": settings.openai_model,
             "notify_threshold": settings.notify_threshold,
@@ -871,6 +1122,32 @@ def status_endpoint():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     with job_status_lock:
         return jsonify({"ok": True, **job_status})
+
+
+@app.get("/test-notify")
+def test_notify_endpoint():
+    if not request_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    send_discord(format_discord_message(sample_disclosure(), sample_score()))
+    return jsonify({"ok": True, "sent": True, "message": "sample Discord notification sent"})
+
+
+@app.get("/test-url")
+def test_url_endpoint():
+    if not request_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    target_url = request.args.get("url", "").strip()
+    if not target_url:
+        return jsonify({"ok": False, "error": "url query parameter is required"}), 400
+    if not target_url.lower().startswith(("http://", "https://")):
+        return jsonify({"ok": False, "error": "url must start with http:// or https://"}), 400
+
+    force_notify = request.args.get("notify", "0").strip().lower() in {"1", "true", "yes", "on"}
+    started = run_test_url_background(target_url, force_notify)
+    if not started:
+        return jsonify({"ok": True, "started": False, "message": "previous run is still in progress"}), 200
+    return jsonify({"ok": True, "started": True, "mode": "test_url", "status": "/status"}), 202
 
 
 @app.get("/run")
