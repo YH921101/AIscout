@@ -562,7 +562,6 @@ def score_disclosure(disclosure: dict[str, Any], pdf_text: str) -> dict[str, Any
             },
             "verbosity": "low",
         },
-        temperature=0.2,
         store=False,
     )
     return json.loads(response.output_text)
